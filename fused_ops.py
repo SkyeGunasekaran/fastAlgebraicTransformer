@@ -1,71 +1,42 @@
 """
 Fused Operations for Algebraic Transformer
 
-Core Triton kernels and utilities used by both forward and backward passes.
-All operations are purely algebraic (no transcendentals like exp, log, sqrt).
+Core Triton kernels for purely algebraic (rational) operations.
+All operations avoid transcendental functions (exp, log, sqrt).
 
 Key operations:
 - Rational sigmoid: σ(x) = 0.5 * (x / (|x| + 1) + 1)
-- Rational softmax: p_i = (σ(x_i))^4 / Σ_j (σ(x_j))^4
-- Rational SwiGLU: gate * σ(gate) * value
+- Rational softmax: p_i = σ(x_i)^4 / Σ_j σ(x_j)^4
+- Rational SwiGLU: gate * σ(gate) * value  
 - Mean-error normalization: x / (mean(|x|) + ε) * γ
 """
 
 import torch
 import triton
 import triton.language as tl
-from typing import Tuple, Optional
+from typing import Optional
 
-
-# =============================================================================
-# CONFIGURATION AND UTILITIES
-# =============================================================================
-
-# Numerical stability constants
+# Numerical stability constant
 EPS = 1e-6
-NEG_INF = -1e4  # Used for masking (not -inf to keep gradients stable)
-
-# Autotuning configurations
-SOFTMAX_CONFIGS = [
-    triton.Config({'BLOCK_SIZE': 256}, num_warps=2),
-    triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
-    triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
-    triton.Config({'BLOCK_SIZE': 2048}, num_warps=8),
-]
-
-NORM_CONFIGS = [
-    triton.Config({'BLOCK_SIZE': 256}, num_warps=2),
-    triton.Config({'BLOCK_SIZE': 512}, num_warps=4),
-    triton.Config({'BLOCK_SIZE': 1024}, num_warps=4),
-]
-
-
-def get_optimal_block_size(n: int, max_block: int = 2048) -> int:
-    """Get optimal block size for a given dimension."""
-    return min(triton.next_power_of_2(n), max_block)
+NEG_INF = -1e4
 
 
 # =============================================================================
-# RATIONAL FUNCTION PRIMITIVES (used in multiple kernels)
+# TRITON KERNEL PRIMITIVES
 # =============================================================================
 
 @triton.jit
 def rational_sigmoid(x):
     """
-    Rational sigmoid approximation: σ(x) = 0.5 * (x / (|x| + 1) + 1)
-    
-    Properties:
-    - Range: (0, 1)
-    - σ(0) = 0.5
-    - Monotonically increasing
-    - Derivative: dσ/dx = 0.5 / (|x| + 1)^2
+    Rational sigmoid: σ(x) = 0.5 * (x / (|x| + 1) + 1)
+    Range: (0, 1), σ(0) = 0.5
     """
     abs_x = tl.abs(x)
     return 0.5 * (x / (abs_x + 1.0) + 1.0)
 
 
 @triton.jit
-def rational_sigmoid_grad(x):
+def rational_sigmoid_deriv(x):
     """
     Derivative of rational sigmoid: dσ/dx = 0.5 / (|x| + 1)^2
     """
@@ -74,111 +45,78 @@ def rational_sigmoid_grad(x):
     return 0.5 / (denom * denom)
 
 
-@triton.jit  
-def rational_softmax_prob(x):
-    """
-    Compute unnormalized rational softmax probability: p = σ(x)^4
-    
-    Uses σ(x)^4 because:
-    - Higher power creates sharper attention distributions
-    - Still bounded in [0, 1] before normalization
-    - Gradient is well-behaved
-    """
-    s = rational_sigmoid(x)
-    s2 = s * s
-    return s2 * s2  # s^4
-
-
-@triton.jit
-def rational_softmax_prob_and_grad(x):
-    """
-    Compute both σ(x)^4 and its gradient d(σ^4)/dx = 4σ^3 * dσ/dx
-    
-    Returns: (prob, d_prob_dx)
-    """
-    abs_x = tl.abs(x)
-    denom = abs_x + 1.0
-    
-    # σ(x) = 0.5 * (x/denom + 1)
-    s = 0.5 * (x / denom + 1.0)
-    
-    # dσ/dx = 0.5 / denom^2
-    ds_dx = 0.5 / (denom * denom)
-    
-    # p = s^4
-    s2 = s * s
-    s3 = s2 * s
-    s4 = s2 * s2
-    
-    # dp/dx = 4 * s^3 * ds/dx
-    dp_dx = 4.0 * s3 * ds_dx
-    
-    return s4, dp_dx
-
-
 # =============================================================================
-# RATIONAL SOFTMAX KERNELS
+# RATIONAL SOFTMAX FORWARD KERNEL
 # =============================================================================
 
-@triton.autotune(configs=SOFTMAX_CONFIGS, key=['N'])
 @triton.jit
 def rational_softmax_fwd_kernel(
     input_ptr,
     output_ptr,
-    N: tl.constexpr,
-    stride_input,
-    stride_output,
+    n_cols,
+    input_row_stride,
+    output_row_stride,
     eps: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Forward kernel for rational softmax over the last dimension.
-    
-    For each row, computes:
-        p_i = σ(x_i)^4 / Σ_j σ(x_j)^4
-    
-    Uses two-pass algorithm:
-    1. First pass: compute sum of σ(x)^4
-    2. Second pass: normalize and store
+    Forward kernel for rational softmax.
+    p_i = σ(x_i)^4 / Σ_j σ(x_j)^4
     """
     row_idx = tl.program_id(0)
     
-    input_row_ptr = input_ptr + row_idx * stride_input
-    output_row_ptr = output_ptr + row_idx * stride_output
+    row_start_in = input_ptr + row_idx * input_row_stride
+    row_start_out = output_ptr + row_idx * output_row_stride
     
-    # First pass: accumulate sum
-    total_sum = tl.zeros([1], dtype=tl.float32)
+    # First pass: compute sum of σ(x)^4
+    total = tl.zeros([1], dtype=tl.float32)
     
-    for block_start in range(0, N, BLOCK_SIZE):
+    for block_start in range(0, n_cols, BLOCK_SIZE):
         col_offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < N
+        mask = col_offsets < n_cols
         
-        x = tl.load(input_row_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        p = rational_softmax_prob(x)
-        total_sum += tl.sum(tl.where(mask, p, 0.0))
+        x = tl.load(row_start_in + col_offsets, mask=mask, other=0.0).to(tl.float32)
+        
+        # σ(x) = 0.5 * (x / (|x| + 1) + 1)
+        abs_x = tl.abs(x)
+        sigma = 0.5 * (x / (abs_x + 1.0) + 1.0)
+        
+        # σ^4
+        sigma2 = sigma * sigma
+        sigma4 = sigma2 * sigma2
+        
+        total += tl.sum(tl.where(mask, sigma4, 0.0))
+    
+    inv_total = 1.0 / (total + eps)
     
     # Second pass: normalize and store
-    inv_sum = 1.0 / (total_sum + eps)
-    
-    for block_start in range(0, N, BLOCK_SIZE):
+    for block_start in range(0, n_cols, BLOCK_SIZE):
         col_offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < N
+        mask = col_offsets < n_cols
         
-        x = tl.load(input_row_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        p = rational_softmax_prob(x)
-        normalized_p = p * inv_sum
+        x = tl.load(row_start_in + col_offsets, mask=mask, other=0.0).to(tl.float32)
         
-        tl.store(output_row_ptr + col_offsets, normalized_p.to(output_ptr.dtype.element_ty), mask=mask)
+        abs_x = tl.abs(x)
+        sigma = 0.5 * (x / (abs_x + 1.0) + 1.0)
+        sigma2 = sigma * sigma
+        sigma4 = sigma2 * sigma2
+        
+        p = sigma4 * inv_total
+        
+        tl.store(row_start_out + col_offsets, p.to(output_ptr.dtype.element_ty), mask=mask)
 
 
-@triton.autotune(configs=SOFTMAX_CONFIGS, key=['N'])
+# =============================================================================
+# RATIONAL SOFTMAX BACKWARD KERNEL
+# =============================================================================
+
 @triton.jit
 def rational_softmax_bwd_kernel(
     grad_output_ptr,
-    output_ptr,  # Forward output (normalized probs)
-    input_ptr,   # Forward input (scores)
+    input_ptr,
+    output_ptr,
     grad_input_ptr,
-    N: tl.constexpr,
+    n_cols,
     stride,
     eps: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -186,205 +124,73 @@ def rational_softmax_bwd_kernel(
     """
     Backward kernel for rational softmax.
     
-    Given: p_i = s_i^4 / Z, where s_i = σ(x_i) and Z = Σ s_j^4
+    Forward: p_i = σ_i^4 / Z, where Z = Σ_j σ_j^4
     
-    Gradient: dp_i/dx_j = (δ_ij * 4s_i^3 * σ'(x_i) * Z - s_i^4 * 4s_j^3 * σ'(x_j)) / Z^2
-                        = p_i * (δ_ij * 4σ'(x_i)/s_i - 4s_j^3 * σ'(x_j) / Z)
+    Let f_i = σ_i^4 (unnormalized), so p_i = f_i / Z
     
-    For efficiency, we compute:
-    dp_i/dx_i = p_i * 4σ'(x_i) * (1/s_i - p_i * s_i^2/s_i^4) 
-              = p_i * 4σ'(x_i) * (1 - p_i) / s_i  [approximately, simplified]
+    df_i/dx_i = 4 * σ_i^3 * σ'_i = 4 * σ_i^3 * (0.5 / (|x_i| + 1)^2)
+              = 2 * σ_i^3 / (|x_i| + 1)^2
     
-    Actually using the standard softmax-style gradient formula adapted:
+    dp_i/dx_i = (df_i/dx_i * Z - f_i * df_i/dx_i) / Z^2
+              = (df_i/dx_i / Z) * (1 - p_i)
+              = p_i * (df_i/dx_i / f_i) * (1 - p_i)
+              = p_i * (4 * σ'_i / σ_i) * (1 - p_i)
+    
+    dp_i/dx_j (j ≠ i) = -f_i * df_j/dx_j / Z^2
+                      = -p_i * p_j * (4 * σ'_j / σ_j)
+    
     dL/dx_i = Σ_j (dL/dp_j * dp_j/dx_i)
-            = dL/dp_i * p_i * local_grad_i - p_i * Σ_j(dL/dp_j * p_j * local_grad_j)
+            = dL/dp_i * p_i * g_i * (1 - p_i) - Σ_{j≠i} dL/dp_j * p_j * p_i * g_i
+            = p_i * g_i * (dL/dp_i * (1 - p_i) - Σ_{j≠i} dL/dp_j * p_j)
+            = p_i * g_i * (dL/dp_i - Σ_j dL/dp_j * p_j)
+            = p_i * g_i * (dL/dp_i - dot(dL/dp, p))
     
-    Where local_grad_i = d(log p_i)/dx_i before normalization = 4σ'(x_i)/σ(x_i)
+    where g_i = 4 * σ'_i / σ_i = 2 / ((|x_i| + 1)^2 * σ_i)
     """
     row_idx = tl.program_id(0)
     
     grad_out_row = grad_output_ptr + row_idx * stride
+    input_row = input_ptr + row_idx * stride
     output_row = output_ptr + row_idx * stride
-    input_row = input_ptr + row_idx * stride
     grad_in_row = grad_input_ptr + row_idx * stride
     
-    # First pass: compute weighted sum for gradient correction
-    # sum_term = Σ_j (grad_out_j * p_j * local_grad_j)
-    sum_term = tl.zeros([1], dtype=tl.float32)
+    # First pass: compute dot(grad_out, p)
+    dot_grad_p = tl.zeros([1], dtype=tl.float32)
     
-    for block_start in range(0, N, BLOCK_SIZE):
+    for block_start in range(0, n_cols, BLOCK_SIZE):
         col_offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < N
+        mask = col_offsets < n_cols
         
         grad_out = tl.load(grad_out_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
         p = tl.load(output_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        x = tl.load(input_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
         
-        # Compute local gradient factor: 4 * σ'(x) / σ(x)
-        # σ(x) = 0.5 * (x/(|x|+1) + 1)
-        # σ'(x) = 0.5 / (|x|+1)^2
-        abs_x = tl.abs(x)
-        denom = abs_x + 1.0
-        sigma = 0.5 * (x / denom + 1.0)
-        sigma_grad = 0.5 / (denom * denom)
-        
-        # Avoid division by zero when sigma is very small
-        local_grad = 4.0 * sigma_grad / (sigma + 1e-8)
-        
-        sum_term += tl.sum(tl.where(mask, grad_out * p * local_grad, 0.0))
-    
-    # Second pass: compute and store gradients
-    for block_start in range(0, N, BLOCK_SIZE):
-        col_offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < N
-        
-        grad_out = tl.load(grad_out_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        p = tl.load(output_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        x = tl.load(input_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        
-        # Recompute local gradient
-        abs_x = tl.abs(x)
-        denom = abs_x + 1.0
-        sigma = 0.5 * (x / denom + 1.0)
-        sigma_grad = 0.5 / (denom * denom)
-        local_grad = 4.0 * sigma_grad / (sigma + 1e-8)
-        
-        # Gradient formula: grad_in = p * local_grad * (grad_out - sum_term)
-        grad_in = p * local_grad * (grad_out - sum_term)
-        
-        tl.store(grad_in_row + col_offsets, grad_in.to(grad_input_ptr.dtype.element_ty), mask=mask)
-
-
-# =============================================================================
-# MEAN-ERROR NORMALIZATION KERNELS
-# =============================================================================
-
-@triton.autotune(configs=NORM_CONFIGS, key=['N'])
-@triton.jit
-def mean_error_norm_fwd_kernel(
-    input_ptr,
-    weight_ptr,
-    output_ptr,
-    N: tl.constexpr,
-    stride_input,
-    stride_output,
-    eps: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """
-    Forward kernel for mean-error normalization.
-    
-    output = (x / (mean(|x|) + eps)) * weight
-    """
-    row_idx = tl.program_id(0)
-    
-    input_row = input_ptr + row_idx * stride_input
-    output_row = output_ptr + row_idx * stride_output
-    
-    # First pass: compute mean of absolute values
-    abs_sum = tl.zeros([1], dtype=tl.float32)
-    
-    for block_start in range(0, N, BLOCK_SIZE):
-        col_offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < N
-        
-        x = tl.load(input_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        abs_sum += tl.sum(tl.where(mask, tl.abs(x), 0.0))
-    
-    mean_abs = abs_sum / N
-    inv_mean = 1.0 / (mean_abs + eps)
-    
-    # Second pass: normalize and apply weight
-    for block_start in range(0, N, BLOCK_SIZE):
-        col_offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < N
-        
-        x = tl.load(input_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(weight_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        
-        normalized = x * inv_mean * w
-        
-        tl.store(output_row + col_offsets, normalized.to(output_ptr.dtype.element_ty), mask=mask)
-
-
-@triton.autotune(configs=NORM_CONFIGS, key=['N'])
-@triton.jit
-def mean_error_norm_bwd_kernel(
-    grad_output_ptr,
-    input_ptr,
-    weight_ptr,
-    grad_input_ptr,
-    grad_weight_ptr,  # Accumulated atomically
-    N: tl.constexpr,
-    stride,
-    eps: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    """
-    Backward kernel for mean-error normalization.
-    
-    Forward: y = (x / μ) * w, where μ = mean(|x|) + eps
-    
-    Gradients:
-    - dy/dx_i = w_i/μ - (x_i * sign(x_i) / (N * μ^2)) * Σ_j (w_j * x_j / μ)
-              = w_i/μ - (sign(x_i) / (N * μ)) * Σ_j (y_j * grad_out_j) * (something)
-    
-    Simplified gradient computation using chain rule.
-    """
-    row_idx = tl.program_id(0)
-    
-    grad_out_row = grad_output_ptr + row_idx * stride
-    input_row = input_ptr + row_idx * stride
-    grad_in_row = grad_input_ptr + row_idx * stride
-    
-    # First pass: compute mean(|x|) and dot product of grad_out with normalized x
-    abs_sum = tl.zeros([1], dtype=tl.float32)
-    dot_prod = tl.zeros([1], dtype=tl.float32)
-    
-    for block_start in range(0, N, BLOCK_SIZE):
-        col_offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < N
-        
-        x = tl.load(input_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        grad_out = tl.load(grad_out_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(weight_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        
-        abs_x = tl.abs(x)
-        abs_sum += tl.sum(tl.where(mask, abs_x, 0.0))
-        
-        # grad_out * w * x / μ contributes to correction term
-        dot_prod += tl.sum(tl.where(mask, grad_out * w * x, 0.0))
-    
-    mean_abs = abs_sum / N
-    inv_mean = 1.0 / (mean_abs + eps)
-    
-    # Correction factor for gradient
-    correction = dot_prod * inv_mean * inv_mean / N
+        dot_grad_p += tl.sum(tl.where(mask, grad_out * p, 0.0))
     
     # Second pass: compute gradients
-    for block_start in range(0, N, BLOCK_SIZE):
+    for block_start in range(0, n_cols, BLOCK_SIZE):
         col_offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < N
+        mask = col_offsets < n_cols
         
         x = tl.load(input_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
+        p = tl.load(output_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
         grad_out = tl.load(grad_out_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(weight_ptr + col_offsets, mask=mask, other=0.0).to(tl.float32)
         
-        # Sign of x for gradient correction
-        sign_x = tl.where(x >= 0, 1.0, -1.0)
+        # Compute g = 4 * σ' / σ = 2 / ((|x| + 1)^2 * σ)
+        abs_x = tl.abs(x)
+        denom = abs_x + 1.0
+        sigma = 0.5 * (x / denom + 1.0)
         
-        # Gradient w.r.t input
-        grad_in = grad_out * w * inv_mean - sign_x * correction
+        # g = 4 * (0.5 / denom^2) / σ = 2 / (denom^2 * σ)
+        g = 2.0 / (denom * denom * (sigma + eps))
+        
+        # grad_in = p * g * (grad_out - dot_grad_p)
+        grad_in = p * g * (grad_out - dot_grad_p)
         
         tl.store(grad_in_row + col_offsets, grad_in.to(grad_input_ptr.dtype.element_ty), mask=mask)
-        
-        # Gradient w.r.t weight (accumulated across rows)
-        grad_w = grad_out * x * inv_mean
-        tl.atomic_add(grad_weight_ptr + col_offsets, grad_w, mask=mask)
 
 
 # =============================================================================
-# SWIGLU KERNELS
+# SWIGLU FORWARD KERNEL
 # =============================================================================
 
 @triton.jit
@@ -392,16 +198,13 @@ def swiglu_fwd_kernel(
     gate_ptr,
     value_ptr,
     output_ptr,
-    N: tl.constexpr,
+    n_cols,
     stride,
     BLOCK_SIZE: tl.constexpr,
 ):
     """
     Forward kernel for rational SwiGLU.
-    
     output = gate * σ(gate) * value
-    
-    Where σ is the rational sigmoid.
     """
     row_idx = tl.program_id(0)
     
@@ -409,19 +212,26 @@ def swiglu_fwd_kernel(
     value_row = value_ptr + row_idx * stride
     output_row = output_ptr + row_idx * stride
     
-    for block_start in range(0, N, BLOCK_SIZE):
+    for block_start in range(0, n_cols, BLOCK_SIZE):
         col_offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < N
+        mask = col_offsets < n_cols
         
         gate = tl.load(gate_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
         value = tl.load(value_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
         
-        # SwiGLU: gate * σ(gate) * value
-        sigma_gate = rational_sigmoid(gate)
-        output = gate * sigma_gate * value
+        # σ(gate)
+        abs_gate = tl.abs(gate)
+        sigma = 0.5 * (gate / (abs_gate + 1.0) + 1.0)
         
-        tl.store(output_row + col_offsets, output.to(output_ptr.dtype.element_ty), mask=mask)
+        # output = gate * σ(gate) * value
+        out = gate * sigma * value
+        
+        tl.store(output_row + col_offsets, out.to(output_ptr.dtype.element_ty), mask=mask)
 
+
+# =============================================================================
+# SWIGLU BACKWARD KERNEL
+# =============================================================================
 
 @triton.jit
 def swiglu_bwd_kernel(
@@ -430,7 +240,7 @@ def swiglu_bwd_kernel(
     value_ptr,
     grad_gate_ptr,
     grad_value_ptr,
-    N: tl.constexpr,
+    n_cols,
     stride,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -439,9 +249,12 @@ def swiglu_bwd_kernel(
     
     Forward: y = gate * σ(gate) * value
     
-    Gradients:
-    - dy/dgate = value * (σ(gate) + gate * σ'(gate))
-    - dy/dvalue = gate * σ(gate)
+    dy/dvalue = gate * σ(gate)
+    
+    dy/dgate = value * d(gate * σ(gate))/dgate
+             = value * (σ(gate) + gate * σ'(gate))
+    
+    where σ'(gate) = 0.5 / (|gate| + 1)^2
     """
     row_idx = tl.program_id(0)
     
@@ -451,142 +264,227 @@ def swiglu_bwd_kernel(
     grad_gate_row = grad_gate_ptr + row_idx * stride
     grad_value_row = grad_value_ptr + row_idx * stride
     
-    for block_start in range(0, N, BLOCK_SIZE):
+    for block_start in range(0, n_cols, BLOCK_SIZE):
         col_offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < N
+        mask = col_offsets < n_cols
         
         grad_out = tl.load(grad_out_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
         gate = tl.load(gate_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
         value = tl.load(value_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
         
-        # Compute sigmoid and its derivative
-        sigma = rational_sigmoid(gate)
-        sigma_grad = rational_sigmoid_grad(gate)
+        # Compute σ(gate) and σ'(gate)
+        abs_gate = tl.abs(gate)
+        denom = abs_gate + 1.0
+        sigma = 0.5 * (gate / denom + 1.0)
+        sigma_deriv = 0.5 / (denom * denom)
         
-        # Gradients
-        grad_gate = grad_out * value * (sigma + gate * sigma_grad)
+        # dy/dvalue = gate * σ(gate)
         grad_value = grad_out * gate * sigma
+        
+        # dy/dgate = value * (σ(gate) + gate * σ'(gate))
+        grad_gate = grad_out * value * (sigma + gate * sigma_deriv)
         
         tl.store(grad_gate_row + col_offsets, grad_gate.to(grad_gate_ptr.dtype.element_ty), mask=mask)
         tl.store(grad_value_row + col_offsets, grad_value.to(grad_value_ptr.dtype.element_ty), mask=mask)
 
 
 # =============================================================================
-# PYTHON WRAPPER FUNCTIONS
+# MEAN-ERROR NORMALIZATION FORWARD KERNEL
 # =============================================================================
 
+@triton.jit
+def mean_error_norm_fwd_kernel(
+    input_ptr,
+    weight_ptr,
+    output_ptr,
+    mean_ptr,  # Store mean for backward
+    n_cols,
+    input_stride,
+    output_stride,
+    eps: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Forward kernel for mean-error normalization.
+    output = (x / (mean(|x|) + eps)) * weight
+    """
+    row_idx = tl.program_id(0)
+    
+    input_row = input_ptr + row_idx * input_stride
+    output_row = output_ptr + row_idx * output_stride
+    
+    # First pass: compute mean(|x|)
+    abs_sum = tl.zeros([1], dtype=tl.float32)
+    
+    for block_start in range(0, n_cols, BLOCK_SIZE):
+        col_offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = col_offsets < n_cols
+        
+        x = tl.load(input_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
+        abs_sum += tl.sum(tl.where(mask, tl.abs(x), 0.0))
+    
+    mean_abs = abs_sum / n_cols
+    inv_mean = 1.0 / (mean_abs + eps)
+    
+    # Store mean for backward pass
+    tl.store(mean_ptr + row_idx, mean_abs)
+    
+    # Second pass: normalize and scale
+    for block_start in range(0, n_cols, BLOCK_SIZE):
+        col_offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = col_offsets < n_cols
+        
+        x = tl.load(input_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(weight_ptr + col_offsets, mask=mask, other=1.0).to(tl.float32)
+        
+        out = x * inv_mean * w
+        
+        tl.store(output_row + col_offsets, out.to(output_ptr.dtype.element_ty), mask=mask)
+
+
+# =============================================================================
+# MEAN-ERROR NORMALIZATION BACKWARD KERNEL
+# =============================================================================
+
+@triton.jit
+def mean_error_norm_bwd_kernel(
+    grad_output_ptr,
+    input_ptr,
+    weight_ptr,
+    mean_ptr,
+    grad_input_ptr,
+    n_cols,
+    stride,
+    eps: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """
+    Backward kernel for mean-error normalization (input gradient only).
+    
+    Forward: y_i = (x_i / μ) * w_i, where μ = mean(|x|) + eps
+    
+    dy_i/dx_j = w_i * d(x_i / μ)/dx_j
+    
+    d(x_i / μ)/dx_j = (δ_ij * μ - x_i * dμ/dx_j) / μ^2
+    
+    dμ/dx_j = sign(x_j) / n
+    
+    So: d(x_i / μ)/dx_j = (δ_ij * μ - x_i * sign(x_j) / n) / μ^2
+                        = δ_ij / μ - x_i * sign(x_j) / (n * μ^2)
+    
+    dL/dx_j = Σ_i (dL/dy_i * dy_i/dx_j)
+            = Σ_i (dL/dy_i * w_i * (δ_ij / μ - x_i * sign(x_j) / (n * μ^2)))
+            = dL/dy_j * w_j / μ - sign(x_j) / (n * μ^2) * Σ_i (dL/dy_i * w_i * x_i)
+            = dL/dy_j * w_j / μ - sign(x_j) * C / (n * μ)
+    
+    where C = (1/μ) * Σ_i (dL/dy_i * w_i * x_i) = Σ_i (dL/dy_i * y_i)
+    """
+    row_idx = tl.program_id(0)
+    
+    grad_out_row = grad_output_ptr + row_idx * stride
+    input_row = input_ptr + row_idx * stride
+    grad_in_row = grad_input_ptr + row_idx * stride
+    
+    # Load precomputed mean
+    mean_abs = tl.load(mean_ptr + row_idx).to(tl.float32)
+    inv_mean = 1.0 / (mean_abs + eps)
+    
+    # First pass: compute C = Σ_i (dL/dy_i * y_i) = Σ_i (dL/dy_i * w_i * x_i / μ)
+    C = tl.zeros([1], dtype=tl.float32)
+    
+    for block_start in range(0, n_cols, BLOCK_SIZE):
+        col_offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = col_offsets < n_cols
+        
+        grad_out = tl.load(grad_out_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(input_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(weight_ptr + col_offsets, mask=mask, other=1.0).to(tl.float32)
+        
+        # y_i = x_i * inv_mean * w_i
+        y = x * inv_mean * w
+        C += tl.sum(tl.where(mask, grad_out * y, 0.0))
+    
+    # Second pass: compute gradients
+    correction = C / n_cols
+    
+    for block_start in range(0, n_cols, BLOCK_SIZE):
+        col_offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = col_offsets < n_cols
+        
+        grad_out = tl.load(grad_out_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(input_row + col_offsets, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(weight_ptr + col_offsets, mask=mask, other=1.0).to(tl.float32)
+        
+        sign_x = tl.where(x >= 0, 1.0, -1.0)
+        
+        # dL/dx_j = dL/dy_j * w_j / μ - sign(x_j) * C / (n * μ)
+        grad_in = grad_out * w * inv_mean - sign_x * correction * inv_mean
+        
+        tl.store(grad_in_row + col_offsets, grad_in.to(grad_input_ptr.dtype.element_ty), mask=mask)
+
+
+# =============================================================================
+# AUTOGRAD FUNCTIONS
+# =============================================================================
+
+def _get_block_size(n: int) -> int:
+    """Get optimal block size for dimension n."""
+    return min(triton.next_power_of_2(n), 1024)
+
+
 class RationalSoftmax(torch.autograd.Function):
-    """Autograd function for rational softmax with custom CUDA kernels."""
+    """Autograd function for rational softmax."""
     
     @staticmethod
-    def forward(ctx, input: torch.Tensor, eps: float = EPS) -> torch.Tensor:
-        assert input.is_cuda, "Input must be on CUDA"
+    def forward(ctx, x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
+        assert x.is_cuda, "Input must be on CUDA"
         
-        # Reshape to 2D for kernel
-        original_shape = input.shape
-        input_2d = input.contiguous().view(-1, input.shape[-1])
-        n_rows, n_cols = input_2d.shape
+        original_shape = x.shape
+        x_2d = x.contiguous().view(-1, x.shape[-1])
+        n_rows, n_cols = x_2d.shape
         
-        # Allocate output
-        output = torch.empty_like(input_2d)
+        output = torch.empty_like(x_2d)
         
-        # Launch kernel
-        grid = (n_rows,)
-        rational_softmax_fwd_kernel[grid](
-            input_2d, output,
+        BLOCK_SIZE = _get_block_size(n_cols)
+        
+        rational_softmax_fwd_kernel[(n_rows,)](
+            x_2d, output,
             n_cols,
-            input_2d.stride(0), output.stride(0),
+            x_2d.stride(0), output.stride(0),
             eps,
+            BLOCK_SIZE=BLOCK_SIZE,
         )
         
-        # Save for backward
-        output_reshaped = output.view(original_shape)
-        ctx.save_for_backward(input, output_reshaped)
+        output = output.view(original_shape)
+        ctx.save_for_backward(x, output)
         ctx.eps = eps
         
-        return output_reshaped
+        return output
     
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
-        input, output = ctx.saved_tensors
+        x, output = ctx.saved_tensors
         eps = ctx.eps
         
-        # Reshape to 2D
-        original_shape = input.shape
-        input_2d = input.contiguous().view(-1, input.shape[-1])
+        original_shape = x.shape
+        x_2d = x.contiguous().view(-1, x.shape[-1])
         output_2d = output.contiguous().view(-1, output.shape[-1])
         grad_output_2d = grad_output.contiguous().view(-1, grad_output.shape[-1])
-        n_rows, n_cols = input_2d.shape
+        n_rows, n_cols = x_2d.shape
         
-        # Allocate gradient
-        grad_input = torch.empty_like(input_2d)
+        grad_input = torch.empty_like(x_2d)
         
-        # Launch kernel
-        grid = (n_rows,)
-        rational_softmax_bwd_kernel[grid](
-            grad_output_2d, output_2d, input_2d, grad_input,
+        BLOCK_SIZE = _get_block_size(n_cols)
+        
+        rational_softmax_bwd_kernel[(n_rows,)](
+            grad_output_2d, x_2d, output_2d, grad_input,
             n_cols,
-            input_2d.stride(0),
+            x_2d.stride(0),
             eps,
+            BLOCK_SIZE=BLOCK_SIZE,
         )
         
         return grad_input.view(original_shape), None
-
-
-class MeanErrorNorm(torch.autograd.Function):
-    """Autograd function for mean-error normalization."""
-    
-    @staticmethod
-    def forward(ctx, input: torch.Tensor, weight: torch.Tensor, eps: float = EPS) -> torch.Tensor:
-        assert input.is_cuda, "Input must be on CUDA"
-        
-        # Reshape to 2D
-        original_shape = input.shape
-        input_2d = input.contiguous().view(-1, input.shape[-1])
-        n_rows, n_cols = input_2d.shape
-        
-        # Allocate output
-        output = torch.empty_like(input_2d)
-        
-        # Launch kernel
-        grid = (n_rows,)
-        mean_error_norm_fwd_kernel[grid](
-            input_2d, weight, output,
-            n_cols,
-            input_2d.stride(0), output.stride(0),
-            eps,
-        )
-        
-        ctx.save_for_backward(input, weight)
-        ctx.eps = eps
-        
-        return output.view(original_shape)
-    
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        input, weight = ctx.saved_tensors
-        eps = ctx.eps
-        
-        # Reshape to 2D
-        original_shape = input.shape
-        input_2d = input.contiguous().view(-1, input.shape[-1])
-        grad_output_2d = grad_output.contiguous().view(-1, grad_output.shape[-1])
-        n_rows, n_cols = input_2d.shape
-        
-        # Allocate gradients
-        grad_input = torch.empty_like(input_2d)
-        grad_weight = torch.zeros_like(weight)
-        
-        # Launch kernel
-        grid = (n_rows,)
-        mean_error_norm_bwd_kernel[grid](
-            grad_output_2d, input_2d, weight, grad_input, grad_weight,
-            n_cols,
-            input_2d.stride(0),
-            eps,
-        )
-        
-        return grad_input.view(original_shape), grad_weight, None
 
 
 class RationalSwiGLU(torch.autograd.Function):
@@ -596,21 +494,16 @@ class RationalSwiGLU(torch.autograd.Function):
     def forward(ctx, gate: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         assert gate.is_cuda and value.is_cuda, "Inputs must be on CUDA"
         
-        # Reshape to 2D
         original_shape = gate.shape
         gate_2d = gate.contiguous().view(-1, gate.shape[-1])
         value_2d = value.contiguous().view(-1, value.shape[-1])
         n_rows, n_cols = gate_2d.shape
         
-        # Allocate output
         output = torch.empty_like(gate_2d)
         
-        # Choose block size
-        BLOCK_SIZE = get_optimal_block_size(n_cols)
+        BLOCK_SIZE = _get_block_size(n_cols)
         
-        # Launch kernel
-        grid = (n_rows,)
-        swiglu_fwd_kernel[grid](
+        swiglu_fwd_kernel[(n_rows,)](
             gate_2d, value_2d, output,
             n_cols,
             gate_2d.stride(0),
@@ -625,23 +518,18 @@ class RationalSwiGLU(torch.autograd.Function):
     def backward(ctx, grad_output: torch.Tensor):
         gate, value = ctx.saved_tensors
         
-        # Reshape to 2D
         original_shape = gate.shape
         gate_2d = gate.contiguous().view(-1, gate.shape[-1])
         value_2d = value.contiguous().view(-1, value.shape[-1])
         grad_output_2d = grad_output.contiguous().view(-1, grad_output.shape[-1])
         n_rows, n_cols = gate_2d.shape
         
-        # Allocate gradients
         grad_gate = torch.empty_like(gate_2d)
         grad_value = torch.empty_like(value_2d)
         
-        # Choose block size
-        BLOCK_SIZE = get_optimal_block_size(n_cols)
+        BLOCK_SIZE = _get_block_size(n_cols)
         
-        # Launch kernel
-        grid = (n_rows,)
-        swiglu_bwd_kernel[grid](
+        swiglu_bwd_kernel[(n_rows,)](
             grad_output_2d, gate_2d, value_2d, grad_gate, grad_value,
             n_cols,
             gate_2d.stride(0),
@@ -651,8 +539,68 @@ class RationalSwiGLU(torch.autograd.Function):
         return grad_gate.view(original_shape), grad_value.view(original_shape)
 
 
+class MeanErrorNorm(torch.autograd.Function):
+    """Autograd function for mean-error normalization."""
+    
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, eps: float = EPS) -> torch.Tensor:
+        assert x.is_cuda, "Input must be on CUDA"
+        
+        original_shape = x.shape
+        x_2d = x.contiguous().view(-1, x.shape[-1])
+        n_rows, n_cols = x_2d.shape
+        
+        output = torch.empty_like(x_2d)
+        mean = torch.empty(n_rows, device=x.device, dtype=torch.float32)
+        
+        BLOCK_SIZE = _get_block_size(n_cols)
+        
+        mean_error_norm_fwd_kernel[(n_rows,)](
+            x_2d, weight, output, mean,
+            n_cols,
+            x_2d.stride(0), output.stride(0),
+            eps,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        
+        ctx.save_for_backward(x, weight, mean)
+        ctx.eps = eps
+        
+        return output.view(original_shape)
+    
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        x, weight, mean = ctx.saved_tensors
+        eps = ctx.eps
+        
+        original_shape = x.shape
+        x_2d = x.contiguous().view(-1, x.shape[-1])
+        grad_output_2d = grad_output.contiguous().view(-1, grad_output.shape[-1])
+        n_rows, n_cols = x_2d.shape
+        
+        grad_input = torch.empty_like(x_2d)
+        
+        BLOCK_SIZE = _get_block_size(n_cols)
+        
+        mean_error_norm_bwd_kernel[(n_rows,)](
+            grad_output_2d, x_2d, weight, mean, grad_input,
+            n_cols,
+            x_2d.stride(0),
+            eps,
+            BLOCK_SIZE=BLOCK_SIZE,
+        )
+        
+        # Compute grad_weight: sum over batch dimension
+        # y = x * inv_mean * w => dy/dw = x * inv_mean
+        inv_mean = 1.0 / (mean.unsqueeze(1) + eps)
+        y = x_2d * inv_mean  # normalized x
+        grad_weight = (grad_output_2d * y).sum(dim=0)
+        
+        return grad_input.view(original_shape), grad_weight, None
+
+
 # =============================================================================
-# CONVENIENCE FUNCTIONS
+# CONVENIENCE FUNCTIONS  
 # =============================================================================
 
 def rational_softmax(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
@@ -662,20 +610,9 @@ def rational_softmax(x: torch.Tensor, eps: float = EPS) -> torch.Tensor:
     else:
         # CPU fallback
         abs_x = x.abs()
-        s = x / (abs_x + 1.0)
-        p_base = (s + 1.0) * 0.5
-        p4 = p_base.pow(4)
-        return p4 / (p4.sum(dim=-1, keepdim=True) + eps)
-
-
-def mean_error_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = EPS) -> torch.Tensor:
-    """Apply mean-error normalization."""
-    if x.is_cuda:
-        return MeanErrorNorm.apply(x, weight, eps)
-    else:
-        # CPU fallback
-        magnitude = x.abs().mean(dim=-1, keepdim=True)
-        return (x / (magnitude + eps)) * weight
+        sigma = 0.5 * (x / (abs_x + 1.0) + 1.0)
+        sigma4 = sigma.pow(4)
+        return sigma4 / (sigma4.sum(dim=-1, keepdim=True) + eps)
 
 
 def rational_swiglu(gate: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
@@ -685,5 +622,15 @@ def rational_swiglu(gate: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
     else:
         # CPU fallback
         abs_gate = gate.abs()
-        sigmoid_approx = 0.5 * (gate / (abs_gate + 1.0) + 1.0)
-        return gate * sigmoid_approx * value
+        sigma = 0.5 * (gate / (abs_gate + 1.0) + 1.0)
+        return gate * sigma * value
+
+
+def mean_error_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = EPS) -> torch.Tensor:
+    """Apply mean-error normalization."""
+    if x.is_cuda:
+        return MeanErrorNorm.apply(x, weight, eps)
+    else:
+        # CPU fallback
+        mean_abs = x.abs().mean(dim=-1, keepdim=True)
+        return (x / (mean_abs + eps)) * weight
