@@ -14,9 +14,7 @@ import triton.language as tl
 import math
 from typing import Optional, Tuple
 
-from .fused_ops import (
-    rational_sigmoid,
-    rational_sigmoid_grad,
+from fused_ops import (
     rational_softmax_prob,
     rational_softmax_prob_and_grad,
     EPS,
