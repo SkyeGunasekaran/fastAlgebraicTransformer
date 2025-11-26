@@ -36,17 +36,9 @@ from typing import Optional, Tuple
 from torch.utils.checkpoint import checkpoint
 
 # Import optimized kernels
-from kernels import (
-    rational_attention,
-    rational_attention_with_recompute,
-    rational_softmax,
-    mean_error_norm,
-    rational_swiglu,
-    compute_alibi_slopes,
-    fused_qkv_projection,
-    EPS,
-)
-
+from backward import rational_attention
+from fused_ops import rational_softmax, mean_error_norm, rational_swiglu, EPS, mean_error_norm, rational_swiglu
+from forward import compute_alibi_slopes, fused_qkv_projection
 
 # =============================================================================
 # MODULE DEFINITIONS
