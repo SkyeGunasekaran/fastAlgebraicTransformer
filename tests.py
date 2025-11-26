@@ -75,7 +75,7 @@ def reference_rational_attention(
 
 def test_rational_softmax_correctness():
     """Test that Triton rational softmax matches reference."""
-    from kernels import rational_softmax
+    from fused_ops import rational_softmax
     
     print("Testing rational softmax correctness...")
     
@@ -110,7 +110,7 @@ def test_rational_softmax_correctness():
 
 def test_rational_swiglu_correctness():
     """Test that Triton SwiGLU matches reference."""
-    from kernels import rational_swiglu
+    from fused_ops import rational_swiglu
     
     print("Testing rational SwiGLU correctness...")
     
@@ -136,7 +136,7 @@ def test_rational_swiglu_correctness():
 
 def test_mean_error_norm_correctness():
     """Test that Triton mean-error norm matches reference."""
-    from kernels import mean_error_norm
+    from fused_ops import mean_error_norm
     
     print("Testing mean-error norm correctness...")
     
@@ -162,7 +162,7 @@ def test_mean_error_norm_correctness():
 
 def test_attention_correctness():
     """Test that Triton attention matches reference."""
-    from kernels import rational_attention, compute_alibi_slopes
+    from fused_ops import rational_attention, compute_alibi_slopes
     
     print("Testing rational attention correctness...")
     
@@ -215,7 +215,7 @@ def test_attention_correctness():
 
 def test_gradients():
     """Test gradient correctness using finite differences."""
-    from kernels import RationalSoftmax, RationalSwiGLU, MeanErrorNorm
+    from fused_ops import RationalSoftmax, RationalSwiGLU, MeanErrorNorm
     
     print("Testing gradients with gradcheck...")
     
@@ -297,7 +297,7 @@ def benchmark_fn(
 
 def benchmark_softmax():
     """Benchmark rational softmax vs reference."""
-    from kernels import rational_softmax
+    from fused_ops import rational_softmax
     
     print("Benchmarking rational softmax...")
     print(f"{'Shape':<30} {'Reference':>15} {'Triton':>15} {'Speedup':>10}")
@@ -324,7 +324,7 @@ def benchmark_softmax():
 
 def benchmark_attention():
     """Benchmark rational attention vs reference."""
-    from kernels import rational_attention, compute_alibi_slopes
+    from fused_ops import rational_attention, compute_alibi_slopes
     
     print("Benchmarking rational attention...")
     print(f"{'Config':<25} {'Reference':>15} {'Triton':>15} {'Speedup':>10}")
@@ -362,7 +362,7 @@ def benchmark_attention():
 
 def benchmark_full_model():
     """Benchmark full model forward + backward."""
-    from kernels.algebraic_model import AlgebraicTransformerLM
+    from algebraic_model import AlgebraicTransformerLM
     
     print("Benchmarking full model forward + backward...")
     print(f"{'Config':<35} {'Forward':>12} {'Backward':>12} {'Total':>12}")
@@ -432,7 +432,7 @@ def benchmark_full_model():
 
 def test_memory_usage():
     """Compare memory usage between reference and Triton implementations."""
-    from kernels import rational_attention, compute_alibi_slopes
+    from fused_ops import rational_attention, compute_alibi_slopes
     
     print("Testing memory usage...")
     print(f"{'Config':<30} {'Reference':>15} {'Triton':>15} {'Reduction':>12}")
